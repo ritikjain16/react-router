@@ -209,6 +209,7 @@ type HistoryState = {
   key?: string;
 };
 
+const BeforeUnloadEventType = "beforeunload";
 const PopStateEventType = "popstate";
 //#endregion
 
@@ -261,7 +262,7 @@ export function createMemoryHistory(
   );
   let action = Action.Pop;
   let listeners = createEvents<Listener>();
-  //   let blockers = createEvents<Blocker>();
+  let blockers = createEvents<Blocker>();
 
   function clampIndex(n: number): number {
     return Math.min(Math.max(n, 0), entries.length - 1);
@@ -270,17 +271,19 @@ export function createMemoryHistory(
     return entries[index];
   }
 
-  function allowTx(action: Action, location: Location): true {
-    // TODO: Implement blocker check
-    return true;
+  function allowTx(action: Action, location: Location, retry: () => void) {
+    return (
+      !blockers.length || (blockers.call({ action, location, retry }), false)
+    );
   }
 
   function push(to: To, state?: any) {
     let nextAction = Action.Push;
     let nextLocation = createMemoryLocation(to, state);
-    if (allowTx(nextAction, nextLocation)) {
-      action = nextAction;
+    let retry = () => push(to, state);
+    if (allowTx(nextAction, nextLocation, retry)) {
       index += 1;
+      action = nextAction;
       entries.splice(index, entries.length, nextLocation);
       if (v5Compat) {
         listeners.call({ action, location: nextLocation });
@@ -291,7 +294,8 @@ export function createMemoryHistory(
   function replace(to: To, state?: any) {
     let nextAction = Action.Replace;
     let nextLocation = createMemoryLocation(to, state);
-    if (allowTx(nextAction, nextLocation)) {
+    let retry = () => replace(to, state);
+    if (allowTx(nextAction, nextLocation, retry)) {
       action = nextAction;
       entries[index] = nextLocation;
       if (v5Compat) {
@@ -304,8 +308,8 @@ export function createMemoryHistory(
     let nextAction = Action.Pop;
     let nextIndex = clampIndex(index + delta);
     let nextLocation = entries[nextIndex];
-
-    if (allowTx(nextAction, nextLocation)) {
+    let retry = () => go(delta);
+    if (allowTx(nextAction, nextLocation, retry)) {
       action = nextAction;
       index = nextIndex;
       listeners.call({ action, location: nextLocation });
@@ -360,8 +364,7 @@ export function createMemoryHistory(
       return listeners.push(fn);
     },
     block(blocker) {
-      // TODO: Implement
-      return () => {};
+      return blockers.push(blocker);
     },
   };
 
@@ -651,8 +654,23 @@ function getUrlBasedHistory(
   let action = Action.Pop;
   let listeners = createEvents<Listener>();
   let blockers = createEvents<Blocker>();
+  let index = (() => {
+    let idx = getIndex();
+    // Index should only be null when we initialize. If not, it's because the
+    // user called history.pushState or history.replaceState directly, in which
+    // case we should log a warning as it will result in bugs.
+    if (idx == null) {
+      idx = 0;
+      globalHistory.replaceState({ ...globalHistory.state, idx }, "");
+    }
+    return idx;
+  })();
 
-  // TODO: Implement w/ allowTx
+  function getIndex(): number {
+    let state = globalHistory.state || { idx: null };
+    return state.idx;
+  }
+
   let blockedPopTx: Transition | null = null;
   function handlePop() {
     if (blockedPopTx) {
@@ -660,11 +678,47 @@ function getUrlBasedHistory(
       blockedPopTx = null;
     } else {
       let nextAction = Action.Pop;
+      let nextIndex = getIndex();
 
-      // TODO: Check for blockers here
-      action = nextAction;
-      listeners.call({ action, location: history.location });
+      if (blockers.length) {
+        if (nextIndex != null) {
+          let delta = index - nextIndex;
+          if (delta) {
+            // Revert the POP
+            blockedPopTx = {
+              action: nextAction,
+              location: history.location,
+              retry() {
+                go(delta * -1);
+              },
+            };
+            go(delta);
+          }
+        } else {
+          // Trying to POP to a location with no index. We did not create
+          // this location, so we can't effectively block the navigation.
+          warning(
+            false,
+            // TODO: Write up a doc that explains our blocking strategy in
+            // detail and link to it here so people can understand better
+            // what is going on and how to avoid it.
+            `You are trying to block a POP navigation to a location that was not ` +
+              `created by React Router. The block will fail silently in ` +
+              `production, but in general you should do all navigation with the ` +
+              `React Router (instead of using window.history.pushState directly) ` +
+              `to avoid this situation.`
+          );
+        }
+      } else {
+        action = nextAction;
+        index = nextIndex;
+        listeners.call({ action, location: history.location });
+      }
     }
+  }
+
+  function go(n: number) {
+    return globalHistory.go(n);
   }
 
   function push(to: To, state?: any) {
@@ -677,6 +731,7 @@ function getUrlBasedHistory(
 
     if (allowTx(nextAction, history.location, retry)) {
       action = nextAction;
+      index = getIndex();
       let historyState = getHistoryState(location);
       let url = history.createHref(location);
 
@@ -705,6 +760,7 @@ function getUrlBasedHistory(
 
     if (allowTx(nextAction, history.location, retry)) {
       action = nextAction;
+      index = getIndex();
       let historyState = getHistoryState(location);
       let url = history.createHref(location);
       globalHistory.replaceState(historyState, "", url);
@@ -716,8 +772,9 @@ function getUrlBasedHistory(
   }
 
   function allowTx(action: Action, location: Location, retry: () => void) {
-    // TODO: Implement blocker check
-    return true;
+    return (
+      !blockers.length || (blockers.call({ action, location, retry }), false)
+    );
   }
 
   let history: History = {
@@ -736,8 +793,21 @@ function getUrlBasedHistory(
       };
     },
     block(blocker) {
-      // TODO: Implement
-      return () => {};
+      let unblock = blockers.push(blocker);
+      if (blockers.length === 1) {
+        window.addEventListener(BeforeUnloadEventType, promptBeforeUnload);
+      }
+
+      return function () {
+        unblock();
+
+        // Remove the beforeunload listener so the document may
+        // still be salvageable in the pagehide event.
+        // See https://html.spec.whatwg.org/#unloading-documents
+        if (!blockers.length) {
+          window.removeEventListener(BeforeUnloadEventType, promptBeforeUnload);
+        }
+      };
     },
     createHref(to) {
       return createHref(window, to);
@@ -753,12 +823,17 @@ function getUrlBasedHistory(
     },
     push,
     replace,
-    go(n) {
-      return globalHistory.go(n);
-    },
+    go,
   };
 
   return history;
+}
+
+function promptBeforeUnload(event: BeforeUnloadEvent) {
+  // Cancel the event.
+  event.preventDefault();
+  // Chrome (and legacy IE) requires returnValue to be set.
+  event.returnValue = "";
 }
 
 //#endregion
