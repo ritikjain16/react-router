@@ -102,6 +102,13 @@ export interface Transition extends Update {
 }
 
 /**
+ * A function that receives transitions when navigation is blocked.
+ */
+export interface Blocker {
+  (tx: Transition): void;
+}
+
+/**
  * Describes a location that is the destination of some navigation, either via
  * `history.push` or `history.replace`. May be either a URL or the pieces of a
  * URL path.
@@ -180,6 +187,15 @@ export interface History {
    * @returns unlisten - A function that may be used to stop listening
    */
   listen(listener: Listener): () => void;
+
+  /**
+   * Prevents the current location from changing and sets up a listener that
+   * will be called instead.
+   *
+   * @param blocker - A function that will be called when a transition is blocked
+   * @returns unblock - A function that may be used to stop blocking
+   */
+  block(blocker: Blocker): () => void;
 }
 
 interface Events<F> {
@@ -245,6 +261,7 @@ export function createMemoryHistory(
   );
   let action = Action.Pop;
   let listeners = createEvents<Listener>();
+  //   let blockers = createEvents<Blocker>();
 
   function clampIndex(n: number): number {
     return Math.min(Math.max(n, 0), entries.length - 1);
@@ -252,6 +269,49 @@ export function createMemoryHistory(
   function getCurrentLocation(): Location {
     return entries[index];
   }
+
+  function allowTx(action: Action, location: Location): true {
+    // TODO: Implement blocker check
+    return true;
+  }
+
+  function push(to: To, state?: any) {
+    let nextAction = Action.Push;
+    let nextLocation = createMemoryLocation(to, state);
+    if (allowTx(nextAction, nextLocation)) {
+      action = nextAction;
+      index += 1;
+      entries.splice(index, entries.length, nextLocation);
+      if (v5Compat) {
+        listeners.call({ action, location: nextLocation });
+      }
+    }
+  }
+
+  function replace(to: To, state?: any) {
+    let nextAction = Action.Replace;
+    let nextLocation = createMemoryLocation(to, state);
+    if (allowTx(nextAction, nextLocation)) {
+      action = nextAction;
+      entries[index] = nextLocation;
+      if (v5Compat) {
+        listeners.call({ action, location: nextLocation });
+      }
+    }
+  }
+
+  function go(delta: number) {
+    let nextAction = Action.Pop;
+    let nextIndex = clampIndex(index + delta);
+    let nextLocation = entries[nextIndex];
+
+    if (allowTx(nextAction, nextLocation)) {
+      action = nextAction;
+      index = nextIndex;
+      listeners.call({ action, location: nextLocation });
+    }
+  }
+
   function createMemoryLocation(
     to: To,
     state: any = null,
@@ -293,30 +353,15 @@ export function createMemoryHistory(
         hash: path.hash || "",
       };
     },
-    push(to, state) {
-      action = Action.Push;
-      let nextLocation = createMemoryLocation(to, state);
-      index += 1;
-      entries.splice(index, entries.length, nextLocation);
-      if (v5Compat) {
-        listeners.call({ action, location: nextLocation });
-      }
-    },
-    replace(to, state) {
-      action = Action.Replace;
-      let nextLocation = createMemoryLocation(to, state);
-      entries[index] = nextLocation;
-      if (v5Compat) {
-        listeners.call({ action, location: nextLocation });
-      }
-    },
-    go(delta) {
-      action = Action.Pop;
-      index = clampIndex(index + delta);
-      listeners.call({ action, location: getCurrentLocation() });
-    },
+    push,
+    replace,
+    go,
     listen(fn) {
       return listeners.push(fn);
+    },
+    block(blocker) {
+      // TODO: Implement
+      return () => {};
     },
   };
 
@@ -605,46 +650,74 @@ function getUrlBasedHistory(
   let globalHistory = window.history;
   let action = Action.Pop;
   let listeners = createEvents<Listener>();
+  let blockers = createEvents<Blocker>();
 
+  // TODO: Implement w/ allowTx
+  let blockedPopTx: Transition | null = null;
   function handlePop() {
-    action = Action.Pop;
-    listeners.call({ action, location: history.location });
+    if (blockedPopTx) {
+      blockers.call(blockedPopTx);
+      blockedPopTx = null;
+    } else {
+      let nextAction = Action.Pop;
+
+      // TODO: Check for blockers here
+      action = nextAction;
+      listeners.call({ action, location: history.location });
+    }
   }
 
   function push(to: To, state?: any) {
-    action = Action.Push;
+    let nextAction = Action.Push;
     let location = createLocation(history.location, to, state);
     if (validateLocation) validateLocation(location, to);
-
-    let historyState = getHistoryState(location);
-    let url = history.createHref(location);
-
-    // try...catch because iOS limits us to 100 pushState calls :/
-    try {
-      globalHistory.pushState(historyState, "", url);
-    } catch (error) {
-      // They are going to lose state here, but there is no real
-      // way to warn them about it since the page will refresh...
-      window.location.assign(url);
+    function retry() {
+      push(to, state);
     }
 
-    if (v5Compat) {
-      listeners.call({ action, location: history.location });
+    if (allowTx(nextAction, history.location, retry)) {
+      action = nextAction;
+      let historyState = getHistoryState(location);
+      let url = history.createHref(location);
+
+      // try...catch because iOS limits us to 100 pushState calls :/
+      try {
+        globalHistory.pushState(historyState, "", url);
+      } catch (error) {
+        // They are going to lose state here, but there is no real
+        // way to warn them about it since the page will refresh...
+        window.location.assign(url);
+      }
+
+      if (v5Compat) {
+        listeners.call({ action, location: history.location });
+      }
     }
   }
 
   function replace(to: To, state?: any) {
-    action = Action.Replace;
+    let nextAction = Action.Replace;
     let location = createLocation(history.location, to, state);
     if (validateLocation) validateLocation(location, to);
-
-    let historyState = getHistoryState(location);
-    let url = history.createHref(location);
-    globalHistory.replaceState(historyState, "", url);
-
-    if (v5Compat) {
-      listeners.call({ action, location: history.location });
+    function retry() {
+      replace(to, state);
     }
+
+    if (allowTx(nextAction, history.location, retry)) {
+      action = nextAction;
+      let historyState = getHistoryState(location);
+      let url = history.createHref(location);
+      globalHistory.replaceState(historyState, "", url);
+
+      if (v5Compat) {
+        listeners.call({ action, location: history.location });
+      }
+    }
+  }
+
+  function allowTx(action: Action, location: Location, retry: () => void) {
+    // TODO: Implement blocker check
+    return true;
   }
 
   let history: History = {
@@ -661,6 +734,10 @@ function getUrlBasedHistory(
         window.removeEventListener(PopStateEventType, handlePop);
         removeListener();
       };
+    },
+    block(blocker) {
+      // TODO: Implement
+      return () => {};
     },
     createHref(to) {
       return createHref(window, to);
