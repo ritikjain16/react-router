@@ -22,6 +22,8 @@ import ReplaceState from "./TestSequences/ReplaceState";
 import EncodedReservedCharacters from "./TestSequences/EncodedReservedCharacters";
 import GoBack from "./TestSequences/GoBack";
 import GoForward from "./TestSequences/GoForward";
+import BlockEverything from "./TestSequences/BlockEverything";
+import BlockPopWithoutListening from "./TestSequences/BlockPopWithoutListening";
 import ListenPopOnly from "./TestSequences/ListenPopOnly";
 
 // TODO: Do we still need this?
@@ -146,6 +148,20 @@ describe("a hash history", () => {
   describe("forward", () => {
     it("calls change listeners with the next location", async () => {
       await GoForward(history);
+    });
+  });
+
+  describe("block", () => {
+    // eslint-disable-next-line jest/no-done-callback, jest/no-disabled-tests
+    it.skip("blocks all transitions", async (done) => {
+      BlockEverything(history, done);
+    });
+  });
+
+  describe("block a POP without listening", () => {
+    // eslint-disable-next-line jest/no-done-callback, jest/no-disabled-tests
+    it.skip("receives the next location and action as arguments", (done) => {
+      BlockPopWithoutListening(history, done);
     });
   });
 });
